@@ -28,11 +28,13 @@ def find_vendor_name_spatial(pdf_path: str, label: str = "Vendor Name") -> str |
     Open the PDF and use coordinate-based extraction to find the value
     that sits directly *below* the given label on the page.
 
-    Uses two strategies:
-      A. Word-level: find the label as extracted words and grab words below.
-      B. Char-level: reconstruct text from raw characters to handle PDFs
-         where Tableau renders the filter area with very small characters
-         that pdfplumber's word extraction misses or fragments.
+    Strategies (tried in order):
+      1. Tableau-filter anchor: find "BLENDED_FISCAL_MONTH_START" in the
+         raw characters, then locate the label nearby and read the value
+         below it.  This avoids false positives from form fields or legal
+         text that also contain "Vendor Name".
+      2. Word-level: find standalone label words and grab words below.
+      3. Char-level (unanchored): search all char lines for the label.
     """
     import pdfplumber
 
@@ -40,20 +42,33 @@ def find_vendor_name_spatial(pdf_path: str, label: str = "Vendor Name") -> str |
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-
-            # ---- Strategy A: word-level extraction ----------------------
+            chars = page.chars
             words = page.extract_words()
+
+            # ---- Strategy 1: Tableau filter anchor ----------------------
+            # The Tableau filter area always contains the marker
+            # "BLENDED_FISCAL_MONTH_START" on the same char-line as the
+            # label.  Anchoring to this avoids false positives.
+            if chars:
+                result = _find_value_below_label_chars(
+                    chars, label, anchor="BLENDED_FISCAL_MONTH_START"
+                )
+                if result:
+                    return _clean(result)
+
+            # ---- Strategy 2: word-level extraction ----------------------
+            # Only match *standalone* label occurrences (no extra words on
+            # the same line right after "Name"), which filters out form
+            # field labels like "Vendor Name (Parent/Legal Entity...)".
             if words:
-                label_hits = _find_label_occurrences(words, label_words)
+                label_hits = _find_label_occurrences(
+                    words, label_words, standalone=True
+                )
                 result = _extract_value_below_words(words, label_hits)
                 if result:
                     return _clean(result)
 
-            # ---- Strategy B: char-level extraction ----------------------
-            # Tableau sometimes renders the filter panel with tiny chars
-            # that don't reconstruct into proper words.  Search raw chars
-            # for the label sequence, then read chars below it.
-            chars = page.chars
+            # ---- Strategy 3: char-level without anchor ------------------
             if chars:
                 result = _find_value_below_label_chars(chars, label)
                 if result:
@@ -107,10 +122,16 @@ def _extract_value_below_words(
     return None
 
 
-def _find_value_below_label_chars(chars: list[dict], label: str) -> str | None:
+def _find_value_below_label_chars(
+    chars: list[dict], label: str, anchor: str | None = None,
+) -> str | None:
     """
     Search raw character data for the label string, then collect characters
     on the next line below (same x-region) to form the value.
+
+    If *anchor* is given (e.g. "BLENDED_FISCAL_MONTH_START"), only consider
+    label occurrences that appear on the same char-line as the anchor text.
+    This prevents false-positive matches in form fields or legal text.
 
     This handles Tableau PDFs where the filter section uses very small text
     that pdfplumber can't reconstruct into words properly.
@@ -146,12 +167,19 @@ def _find_value_below_label_chars(chars: list[dict], label: str) -> str | None:
     # Search for the label in each reconstructed line
     # Normalize: replace tabs and multiple spaces with single space for matching
     label_lower = label.lower().strip()
+    anchor_lower = anchor.lower().strip() if anchor else None
     for idx, (top, x0, x1, text) in enumerate(line_data):
         # Normalize the line text for matching (tabs → spaces, collapse whitespace)
         normalized = re.sub(r"[\t ]+", " ", text).lower()
         pos = normalized.find(label_lower)
         if pos == -1:
             continue
+
+        # If an anchor is required, the line must also contain the anchor text
+        if anchor_lower:
+            anchor_norm = re.sub(r"[\t ]+", " ", text).lower()
+            if anchor_lower not in re.sub(r"[\s]+", "", anchor_norm):
+                continue
 
         # Estimate the x-range of the label within the line
         # Get chars on this line that correspond to the label position
@@ -243,11 +271,18 @@ def _find_chars_for_substring(line_chars: list[dict], substring: str) -> list[di
     return line_chars[start_orig : end_orig + 1]
 
 
-def _find_label_occurrences(words: list[dict], label_words: list[str]) -> list[list[dict]]:
+def _find_label_occurrences(
+    words: list[dict],
+    label_words: list[str],
+    standalone: bool = False,
+) -> list[list[dict]]:
     """
     Find all occurrences of a multi-word label in the word list,
     where the words are on the same line (similar top) and adjacent.
-    Returns a list of groups, each group being a list of word dicts.
+
+    If *standalone* is True, only return occurrences where the label is
+    NOT followed by more words on the same line (i.e. it's a standalone
+    label, not part of a longer phrase like "Vendor Name (Parent/Legal...)").
     """
     occurrences = []
     n = len(label_words)
@@ -267,6 +302,16 @@ def _find_label_occurrences(words: list[dict], label_words: list[str]) -> list[l
                     break
             group.append(w)
         if match:
+            if standalone:
+                # Check that no words follow on the same line
+                last_word = group[-1]
+                has_follower = False
+                if i + n < len(words):
+                    next_word = words[i + n]
+                    if abs(next_word["top"] - last_word["top"]) < 3:
+                        has_follower = True
+                if has_follower:
+                    continue
             occurrences.append(group)
     return occurrences
 
