@@ -25,19 +25,14 @@ from pathlib import Path
 
 def find_vendor_name_spatial(pdf_path: str, label: str = "Vendor Name") -> str | None:
     """
-    Open the PDF and use word-level coordinates to find the value that
-    sits directly *below* the given label on the page.
+    Open the PDF and use coordinate-based extraction to find the value
+    that sits directly *below* the given label on the page.
 
-    This is the primary strategy for Tableau-generated PDFs, where filter
-    labels and their values are stacked vertically but pdfplumber's plain
-    text extraction merges them horizontally with unrelated text.
-
-    Algorithm:
-      1. Find all words on the page.
-      2. Locate the word group that forms the label (e.g. "Vendor" + "Name").
-      3. Collect all words whose horizontal position overlaps with the label
-         and whose vertical position is immediately below it.
-      4. Join those words into the value string.
+    Uses two strategies:
+      A. Word-level: find the label as extracted words and grab words below.
+      B. Char-level: reconstruct text from raw characters to handle PDFs
+         where Tableau renders the filter area with very small characters
+         that pdfplumber's word extraction misses or fragments.
     """
     import pdfplumber
 
@@ -45,58 +40,207 @@ def find_vendor_name_spatial(pdf_path: str, label: str = "Vendor Name") -> str |
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
+
+            # ---- Strategy A: word-level extraction ----------------------
             words = page.extract_words()
-            if not words:
-                continue
+            if words:
+                label_hits = _find_label_occurrences(words, label_words)
+                result = _extract_value_below_words(words, label_hits)
+                if result:
+                    return _clean(result)
 
-            # --- Step 1: find the label word sequence -----------------------
-            label_hits = _find_label_occurrences(words, label_words)
-
-            for label_group in label_hits:
-                # Bounding box of the whole label
-                lbl_x0 = min(w["x0"] for w in label_group)
-                lbl_x1 = max(w["x1"] for w in label_group)
-                lbl_bottom = max(w["bottom"] for w in label_group)
-                lbl_top = min(w["top"] for w in label_group)
-                lbl_height = lbl_bottom - lbl_top
-
-                # --- Step 2: collect words directly below the label ---------
-                # "Below" = top is between label bottom and label bottom + 4×height
-                # "Overlapping horizontally" = word overlaps the label's x range
-                max_gap = lbl_height * 4  # generous vertical gap tolerance
-                candidates = []
-                for w in words:
-                    if w in label_group:
-                        continue
-                    # Must be below the label
-                    if w["top"] < lbl_bottom - 1:
-                        continue
-                    if w["top"] > lbl_bottom + max_gap:
-                        continue
-                    # Must overlap horizontally with the label region
-                    # (allow some tolerance for slight misalignment)
-                    tolerance = lbl_height
-                    if w["x1"] < lbl_x0 - tolerance or w["x0"] > lbl_x1 + tolerance:
-                        continue
-                    candidates.append(w)
-
-                if not candidates:
-                    continue
-
-                # Group candidates into lines (words sharing similar top values)
-                candidates.sort(key=lambda w: (w["top"], w["x0"]))
-                first_line_top = candidates[0]["top"]
-                first_line_words = [
-                    w for w in candidates
-                    if abs(w["top"] - first_line_top) < lbl_height * 0.5
-                ]
-                first_line_words.sort(key=lambda w: w["x0"])
-
-                value = " ".join(w["text"] for w in first_line_words).strip()
-                if value:
-                    return _clean(value)
+            # ---- Strategy B: char-level extraction ----------------------
+            # Tableau sometimes renders the filter panel with tiny chars
+            # that don't reconstruct into proper words.  Search raw chars
+            # for the label sequence, then read chars below it.
+            chars = page.chars
+            if chars:
+                result = _find_value_below_label_chars(chars, label)
+                if result:
+                    return _clean(result)
 
     return None
+
+
+def _extract_value_below_words(
+    words: list[dict],
+    label_hits: list[list[dict]],
+) -> str | None:
+    """Given label word groups, find the first line of words below each."""
+    for label_group in label_hits:
+        lbl_x0 = min(w["x0"] for w in label_group)
+        lbl_x1 = max(w["x1"] for w in label_group)
+        lbl_bottom = max(w["bottom"] for w in label_group)
+        lbl_top = min(w["top"] for w in label_group)
+        lbl_height = lbl_bottom - lbl_top
+
+        max_gap = lbl_height * 4
+        tolerance = max(lbl_height, 5)
+        candidates = []
+        for w in words:
+            if w in label_group:
+                continue
+            if w["top"] < lbl_bottom - 1:
+                continue
+            if w["top"] > lbl_bottom + max_gap:
+                continue
+            if w["x1"] < lbl_x0 - tolerance or w["x0"] > lbl_x1 + tolerance:
+                continue
+            candidates.append(w)
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda w: (w["top"], w["x0"]))
+        first_line_top = candidates[0]["top"]
+        threshold = max(lbl_height * 0.5, 2)
+        first_line_words = [
+            w for w in candidates
+            if abs(w["top"] - first_line_top) < threshold
+        ]
+        first_line_words.sort(key=lambda w: w["x0"])
+
+        value = " ".join(w["text"] for w in first_line_words).strip()
+        if value:
+            return value
+
+    return None
+
+
+def _find_value_below_label_chars(chars: list[dict], label: str) -> str | None:
+    """
+    Search raw character data for the label string, then collect characters
+    on the next line below (same x-region) to form the value.
+
+    This handles Tableau PDFs where the filter section uses very small text
+    that pdfplumber can't reconstruct into words properly.
+    """
+    # Group chars into lines by similar 'top' values (within 1 unit)
+    line_groups: dict[float, list[dict]] = {}
+    for c in chars:
+        # Round top to nearest 0.5 to group chars on the same line
+        key = round(c["top"] * 2) / 2
+        line_groups.setdefault(key, []).append(c)
+
+    # Sort each line's chars by x position and reconstruct text
+    lines_sorted = sorted(line_groups.keys())
+    line_data = []  # list of (top, x0, x1, text)
+    for top_key in lines_sorted:
+        line_chars = sorted(line_groups[top_key], key=lambda c: c["x0"])
+        # Reconstruct text with spaces where there are gaps
+        parts = []
+        prev_x1 = None
+        for c in line_chars:
+            if prev_x1 is not None:
+                gap = c["x0"] - prev_x1
+                char_width = c.get("width", c["x1"] - c["x0"]) if "x1" in c else 3
+                if gap > char_width * 0.5:
+                    parts.append(" ")
+            parts.append(c["text"])
+            prev_x1 = c.get("x1", c["x0"] + 3)
+        text = "".join(parts)
+        x0 = line_chars[0]["x0"]
+        x1 = line_chars[-1].get("x1", line_chars[-1]["x0"] + 3)
+        line_data.append((top_key, x0, x1, text))
+
+    # Search for the label in each reconstructed line
+    # Normalize: replace tabs and multiple spaces with single space for matching
+    label_lower = label.lower().strip()
+    for idx, (top, x0, x1, text) in enumerate(line_data):
+        # Normalize the line text for matching (tabs → spaces, collapse whitespace)
+        normalized = re.sub(r"[\t ]+", " ", text).lower()
+        pos = normalized.find(label_lower)
+        if pos == -1:
+            continue
+
+        # Estimate the x-range of the label within the line
+        # Get chars on this line that correspond to the label position
+        line_chars = sorted(line_groups[top], key=lambda c: c["x0"])
+        char_positions = []
+        running_pos = 0
+        for c in line_chars:
+            char_positions.append((running_pos, c))
+            running_pos += 1  # approximate
+
+        # Use the label's x-range from the chars
+        lbl_x0 = line_chars[0]["x0"] if pos == 0 else x0
+        lbl_x1 = x1
+
+        # More precise: find x-range by scanning chars that form the label
+        lbl_chars = _find_chars_for_substring(line_chars, label)
+        if lbl_chars:
+            lbl_x0 = lbl_chars[0]["x0"]
+            lbl_x1 = lbl_chars[-1].get("x1", lbl_chars[-1]["x0"] + 3)
+
+        lbl_height = 3  # approximate for small text
+
+        # Look at the next few lines below for the value
+        for next_idx in range(idx + 1, min(idx + 4, len(line_data))):
+            next_top, next_x0, next_x1, next_text = line_data[next_idx]
+            gap = next_top - top
+            if gap > 20:  # too far below
+                break
+            if gap < 0.5:  # same line
+                continue
+
+            # Check horizontal overlap with the label
+            tolerance = max(lbl_x1 - lbl_x0, 10)
+            if next_x1 < lbl_x0 - tolerance or next_x0 > lbl_x1 + tolerance:
+                continue
+
+            # Extract just the portion of text that overlaps with label x-range
+            next_line_chars = sorted(
+                line_groups.get(line_data[next_idx][0], []),
+                key=lambda c: c["x0"],
+            )
+            overlapping = [
+                c for c in next_line_chars
+                if c.get("x1", c["x0"] + 3) >= lbl_x0 - tolerance
+                and c["x0"] <= lbl_x1 + tolerance
+            ]
+            if overlapping:
+                parts = []
+                prev_x1_val = None
+                for c in overlapping:
+                    if prev_x1_val is not None:
+                        gap_x = c["x0"] - prev_x1_val
+                        cw = c.get("width", 3)
+                        if gap_x > max(cw * 0.3, 1.5):
+                            parts.append(" ")
+                    parts.append(c["text"])
+                    prev_x1_val = c.get("x1", c["x0"] + 3)
+                value = "".join(parts).strip()
+                # Filter out values that look like other labels or dates
+                if value and not re.match(r"^\d{1,2}/\d{1,2}/\d{4}", value):
+                    return value
+
+    return None
+
+
+def _find_chars_for_substring(line_chars: list[dict], substring: str) -> list[dict]:
+    """
+    Find the sequence of char dicts that correspond to a substring
+    within a line of characters.  Ignores whitespace and tabs when
+    matching so that "Vendor Name" matches "Vendor\\tName".
+    """
+    # Strip all whitespace from both the char sequence and the target
+    sub_lower = re.sub(r"\s+", "", substring.lower())
+    # Build a mapping: index-in-stripped-text → original char index
+    stripped_chars = []  # (stripped_index, original_char_index)
+    stripped_text = []
+    for i, c in enumerate(line_chars):
+        if c["text"].strip():  # skip whitespace chars
+            stripped_chars.append(i)
+            stripped_text.append(c["text"].lower())
+
+    joined = "".join(stripped_text)
+    pos = joined.find(sub_lower)
+    if pos == -1:
+        return []
+
+    start_orig = stripped_chars[pos]
+    end_orig = stripped_chars[pos + len(sub_lower) - 1]
+    return line_chars[start_orig : end_orig + 1]
 
 
 def _find_label_occurrences(words: list[dict], label_words: list[str]) -> list[list[dict]]:
